@@ -1,5 +1,20 @@
-// ===== MAINSPRING TRACKER — Soft Light Mode =====
+// ===== MAINSPRING TRACKER — Soft Light Mode (with Rejected Defects + Extended Weeks + Decimal Leaves) =====
 // Save as "server.js" in your mainspring-tracker folder
+// IMPORTANT: Run this SQL in Supabase first (to create the new rejected_defects table):
+//
+// CREATE TABLE IF NOT EXISTS rejected_defects (
+//   id BIGSERIAL PRIMARY KEY,
+//   entry_id BIGINT NOT NULL REFERENCES mainspring_entries(id) ON DELETE CASCADE,
+//   project TEXT NOT NULL,
+//   jira_id TEXT,
+//   issue_summary TEXT,
+//   reason TEXT,
+//   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+// );
+// CREATE INDEX IF NOT EXISTS idx_rejected_entry ON rejected_defects(entry_id);
+// ALTER TABLE rejected_defects ENABLE ROW LEVEL SECURITY;
+// CREATE POLICY "Allow all operations on rejected_defects" ON rejected_defects FOR ALL USING (true) WITH CHECK (true);
+//
 // Run: node server.js
 // Visit: http://localhost:3000
 
@@ -11,10 +26,8 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ===== SUPABASE CLIENT =====
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ===== CONSTANTS =====
 const SUB_TEAMS = ["Axiom", "Allegro", "Hydra/NA Capture", "IMOS"];
 const PROJECTS = ["FOS", "MOS", "Pluto"];
 
@@ -60,10 +73,11 @@ const today = new Date();
 const startMonth = today.getMonth() - 6;
 const startYear = today.getFullYear() + (startMonth < 0 ? -1 : 0);
 const adjustedStartMonth = (startMonth + 12) % 12;
+// CHANGED: Now generates weeks from 6 months ago through end of December 2026
 const WEEKS = generateWeeks(adjustedStartMonth === 0 ? startYear : startYear,
-                             adjustedStartMonth, today.getFullYear(), today.getMonth() + 1);
+                             adjustedStartMonth, 2026, 11);
 
-// ===== SOFT LIGHT MODE STYLES =====
+// ===== STYLES =====
 function getStyles() {
   return `<style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -136,6 +150,11 @@ tr:hover td{background:#fafafa}
 
 .totals-row{background:#ebf4ff !important;font-weight:bold}
 .totals-row td{color:#4c51bf !important;font-weight:bold}
+
+.delete-link{color:#ec7372;font-size:11px;margin-left:6px}
+.delete-link:hover{color:#d35d5c}
+
+.action-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px}
 </style>`;
 }
 
@@ -180,8 +199,8 @@ app.get("/", (req, res) => {
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label>No. of Leaves</label>
-            <input class="compact-input" type="number" name="${proj}_leaves" min="0" value="0" />
+            <label>No. of Leaves (supports half-days like 0.5, 1.5)</label>
+            <input class="compact-input" type="number" name="${proj}_leaves" min="0" step="0.5" value="0" />
           </div>
           <div class="form-group">
             <label>No. of Requirements</label>
@@ -242,8 +261,15 @@ app.get("/", (req, res) => {
           <div class="form-group"><div class="field-label">High</div><input class="compact-input" type="number" name="${proj}_func_defect_high" min="0" value="0" /></div>
           <div class="form-group"><div class="field-label">Medium</div><input class="compact-input" type="number" name="${proj}_func_defect_medium" min="0" value="0" /></div>
           <div class="form-group"><div class="field-label">Low</div><input class="compact-input" type="number" name="${proj}_func_defect_low" min="0" value="0" /></div>
-          <div class="form-group"><div class="field-label">Rejected</div><input class="compact-input" type="number" name="${proj}_func_defect_rejected" min="0" value="0" /></div>
+          <div class="form-group"><div class="field-label">Rejected</div><input class="compact-input rejected-input" type="number" name="${proj}_func_defect_rejected" data-project="${proj}" min="0" value="0" /></div>
         </div>
+
+        <div class="rejected-section" id="rejected-${proj}" style="display:none;background:#fff5e6;border:1px solid #f0a04b;border-radius:8px;padding:14px;margin-top:10px">
+          <div class="section-title" style="color:#c2682a">Rejected Defects Details — ${proj}</div>
+          <p style="font-size:12px;color:#718096;margin-bottom:10px">Please provide details for each rejected defect. The number of rows below should match the Rejected count entered above.</p>
+          <div id="rejected-rows-${proj}"></div>
+        </div>
+
         <div class="subsection-title">Regression Defects</div>
         <div class="form-row-4">
           <div class="form-group"><div class="field-label">Critical</div><input class="compact-input" type="number" name="${proj}_reg_defect_critical" min="0" value="0" /></div>
@@ -303,6 +329,85 @@ app.get("/", (req, res) => {
       function toggleAll(open) {
         document.querySelectorAll('.proj-collapse').forEach(d => d.open = open);
       }
+
+      function buildRejectedRows(project, count) {
+        const container = document.getElementById('rejected-rows-' + project);
+        const section = document.getElementById('rejected-' + project);
+
+        if (count <= 0) {
+          section.style.display = 'none';
+          container.innerHTML = '';
+          return;
+        }
+
+        section.style.display = 'block';
+        const existing = [];
+        container.querySelectorAll('.rejected-row').forEach((row, idx) => {
+          existing[idx] = {
+            jira: row.querySelector('[data-field=jira]').value,
+            summary: row.querySelector('[data-field=summary]').value,
+            reason: row.querySelector('[data-field=reason]').value
+          };
+        });
+
+        let html = '';
+        for (let i = 0; i < count; i++) {
+          const e = existing[i] || { jira: '', summary: '', reason: '' };
+          html += '<div class="rejected-row" style="background:#fff;padding:10px;border-radius:6px;margin-bottom:8px;border:1px solid #ece6dc">'
+            + '<div style="font-size:11px;font-weight:600;color:#c2682a;margin-bottom:6px">Rejected Defect #' + (i+1) + '</div>'
+            + '<div style="display:grid;grid-template-columns:80px 1fr 2fr 2fr;gap:8px">'
+            + '<div class="form-group" style="margin-bottom:0"><div class="field-label">Project</div>'
+            + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_project" value="' + project + '" /></div>'
+            + '<div class="form-group" style="margin-bottom:0"><div class="field-label">JIRA ID *</div>'
+            + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_jira" data-field="jira" placeholder="e.g. PROJ-1234" value="' + e.jira + '" required /></div>'
+            + '<div class="form-group" style="margin-bottom:0"><div class="field-label">Issue Summary *</div>'
+            + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_summary" data-field="summary" placeholder="Brief description of the issue" value="' + e.summary + '" required /></div>'
+            + '<div class="form-group" style="margin-bottom:0"><div class="field-label">Reason for Rejection *</div>'
+            + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_reason" data-field="reason" placeholder="e.g. Duplicate, Not reproducible" value="' + e.reason + '" required /></div>'
+            + '</div></div>';
+        }
+        container.innerHTML = html;
+      }
+
+      document.querySelectorAll('.rejected-input').forEach(input => {
+        input.addEventListener('input', (e) => {
+          const project = e.target.dataset.project;
+          const count = parseInt(e.target.value) || 0;
+          buildRejectedRows(project, count);
+        });
+      });
+
+      document.querySelector('form[action="/submit"]').addEventListener('submit', (e) => {
+        let valid = true;
+        let firstError = null;
+
+        document.querySelectorAll('.rejected-input').forEach(input => {
+          const project = input.dataset.project;
+          const count = parseInt(input.value) || 0;
+          if (count > 0) {
+            const rows = document.querySelectorAll('#rejected-rows-' + project + ' .rejected-row');
+            if (rows.length !== count) {
+              valid = false;
+              firstError = firstError || ('Project ' + project + ': expected ' + count + ' rejected defect rows, found ' + rows.length);
+            } else {
+              rows.forEach((row, idx) => {
+                const jira = row.querySelector('[data-field=jira]').value.trim();
+                const summary = row.querySelector('[data-field=summary]').value.trim();
+                const reason = row.querySelector('[data-field=reason]').value.trim();
+                if (!jira || !summary || !reason) {
+                  valid = false;
+                  firstError = firstError || ('Project ' + project + ', Rejected Defect #' + (idx+1) + ': all fields (JIRA ID, Issue Summary, Reason) are required');
+                }
+              });
+            }
+          }
+        });
+
+        if (!valid) {
+          e.preventDefault();
+          alert('Please fix the following before submitting:\\n\\n' + firstError);
+        }
+      });
     </script>
     </body></html>`);
 });
@@ -318,8 +423,6 @@ app.post("/submit", async (req, res) => {
       const get = (field) => req.body[`${proj}_${field}`] || "";
       const getNum = (field) => parseFloat(req.body[`${proj}_${field}`]) || 0;
 
-      // Check if any data was entered for this project
-      // We only count numeric productivity fields, not resource text fields
       const hasNumericData = getNum("leaves") > 0 || getNum("requirements") > 0 ||
         getNum("ft_design_high_tcs") > 0 || getNum("ft_design_high_time") > 0 ||
         getNum("ft_design_medium_tcs") > 0 || getNum("ft_design_medium_time") > 0 ||
@@ -341,12 +444,10 @@ app.post("/submit", async (req, res) => {
         getNum("prod_defect_critical") > 0 || getNum("prod_defect_high") > 0 ||
         getNum("prod_defect_medium") > 0 || getNum("prod_defect_low") > 0;
 
-      // Check if resource fields were filled
       const hasResourceData = get("resource_count").trim() !== "" ||
         get("resource_activity").trim() !== "" ||
         get("resource_names").trim() !== "";
 
-      // Skip this project entirely if nothing was entered
       if (!hasNumericData && !hasResourceData) return null;
 
       return {
@@ -376,14 +477,46 @@ app.post("/submit", async (req, res) => {
         prod_defect_critical: getNum("prod_defect_critical"), prod_defect_high: getNum("prod_defect_high"),
         prod_defect_medium: getNum("prod_defect_medium"), prod_defect_low: getNum("prod_defect_low"),
       };
-    }).filter(row => row !== null); // Remove projects with no data
+    }).filter(row => row !== null);
 
     if (rows.length === 0) {
       return res.send(`<p>No data entered for any project. <a href="/">Go back</a> and fill in at least one project.</p>`);
     }
 
-    const { error } = await supabase.from("mainspring_entries").insert(rows);
+    const { data: insertedRows, error } = await supabase.from("mainspring_entries").insert(rows).select();
     if (error) { console.log("Insert error:", error); return res.send(`<p>Error: ${error.message}</p>`); }
+
+    // Insert rejected defects if any
+    const rejectedRows = [];
+    for (const proj of PROJECTS) {
+      const rejectedCount = parseInt(req.body[`${proj}_func_defect_rejected`]) || 0;
+      if (rejectedCount > 0) {
+        const entryForProj = insertedRows.find(r => r.project === proj);
+        if (!entryForProj) continue;
+
+        for (let i = 0; i < rejectedCount; i++) {
+          const jira = (req.body[`rejected_${proj}_${i}_jira`] || "").trim();
+          const summary = (req.body[`rejected_${proj}_${i}_summary`] || "").trim();
+          const reason = (req.body[`rejected_${proj}_${i}_reason`] || "").trim();
+          const projectName = (req.body[`rejected_${proj}_${i}_project`] || proj).trim();
+          if (jira || summary || reason) {
+            rejectedRows.push({
+              entry_id: entryForProj.id,
+              project: projectName,
+              jira_id: jira,
+              issue_summary: summary,
+              reason: reason
+            });
+          }
+        }
+      }
+    }
+
+    if (rejectedRows.length > 0) {
+      const { error: rejectedError } = await supabase.from("rejected_defects").insert(rejectedRows);
+      if (rejectedError) console.log("Rejected defects insert error:", rejectedError);
+    }
+
     res.redirect("/?saved=1");
   } catch (err) {
     console.log("Submit error:", err);
@@ -400,9 +533,16 @@ app.get("/dashboard", async (req, res) => {
   const weekOptions = uniqueWeeks.map(w => `<option value="${w}" ${w === selectedWeek ? "selected" : ""}>${w}</option>`).join("");
 
   let entries = [];
+  let rejectedDefects = [];
   if (selectedWeek) {
     const { data } = await supabase.from("mainspring_entries").select("*").eq("week_label", selectedWeek);
     entries = data || [];
+
+    if (entries.length > 0) {
+      const entryIds = entries.map(e => e.id);
+      const { data: rejData } = await supabase.from("rejected_defects").select("*").in("entry_id", entryIds);
+      rejectedDefects = rejData || [];
+    }
   }
 
   function buildProjectView(projectName) {
@@ -466,6 +606,28 @@ app.get("/dashboard", async (req, res) => {
         </td>
       </tr>
     `).join("");
+
+    // Build rejected defects section for this project
+    const projEntryIds = v.projEntries.map(e => e.id);
+    const projRejected = rejectedDefects.filter(r => projEntryIds.includes(r.entry_id));
+    let rejectedHtml = "";
+    if (projRejected.length > 0) {
+      const rejRows = projRejected.map(r => {
+        const submitter = v.projEntries.find(e => e.id === r.entry_id);
+        return `<tr>
+          <td><strong>${r.jira_id || "-"}</strong></td>
+          <td>${r.issue_summary || "-"}</td>
+          <td>${r.reason || "-"}</td>
+          <td style="color:#718096;font-size:12px">${submitter ? submitter.sub_team : "-"}</td>
+          <td><a href="/edit-rejected/${r.id}" class="btn btn-small" style="background:#5b6ee1">Edit</a> <a href="/delete-rejected/${r.id}" class="delete-link" onclick="return confirm('Delete this rejected defect?')">Delete</a></td>
+        </tr>`;
+      }).join("");
+      rejectedHtml = `<h3 style="margin-top:14px;color:#c2682a">Rejected Defects (${projRejected.length})</h3>
+      <table>
+        <tr><th>JIRA ID</th><th>Issue Summary</th><th>Reason for Rejection</th><th>Sub-Team</th><th>Actions</th></tr>
+        ${rejRows}
+      </table>`;
+    }
 
     return `<details class="proj-collapse">
       <summary class="proj-summary">
@@ -541,6 +703,8 @@ Production: Critical=${v.totals.prod_defect_critical}, High=${v.totals.prod_defe
         <tr class="totals-row"><td>Production</td><td>${v.totals.prod_defect_critical}</td><td>${v.totals.prod_defect_high}</td><td>${v.totals.prod_defect_medium}</td><td>${v.totals.prod_defect_low}</td><td>-</td></tr>
       </table>
 
+      ${rejectedHtml}
+
       <details style="margin-top:14px">
         <summary style="cursor:pointer;color:#5b6ee1;font-weight:bold;font-size:14px;padding:8px">▶ View Individual Sub-team Contributions (${v.projEntries.length} entries)</summary>
         <table style="margin-top:10px">
@@ -596,7 +760,8 @@ app.get("/edit/:id", async (req, res) => {
   const inputs = fields.map(f => {
     const isText = f.startsWith("resource_") && !f.includes("count");
     const type = isText ? "text" : (f === "resource_count" ? "text" : "number");
-    return `<div class="form-group"><label>${f}</label><input class="compact-input" type="${type}" name="${f}" value="${entry[f] || (type === 'number' ? 0 : '')}" /></div>`;
+    const step = f === "leaves" ? ' step="0.5"' : '';
+    return `<div class="form-group"><label>${f}</label><input class="compact-input" type="${type}"${step} name="${f}" value="${entry[f] || (type === 'number' ? 0 : '')}" /></div>`;
   }).join("");
 
   res.send(`<!DOCTYPE html><html><head><title>Edit Entry — MainSpring Tracker</title>${getStyles()}</head><body>
@@ -626,6 +791,43 @@ app.post("/update/:id", async (req, res) => {
 
 app.get("/delete/:id", async (req, res) => {
   await supabase.from("mainspring_entries").delete().eq("id", req.params.id);
+  res.redirect("/dashboard");
+});
+
+// ===== EDIT / DELETE REJECTED DEFECTS =====
+app.get("/edit-rejected/:id", async (req, res) => {
+  const { data: rej } = await supabase.from("rejected_defects").select("*").eq("id", req.params.id).single();
+  if (!rej) return res.redirect("/dashboard");
+
+  res.send(`<!DOCTYPE html><html><head><title>Edit Rejected Defect</title>${getStyles()}</head><body>
+    ${getNav("dashboard")}
+    <div class="container">
+      <a href="/dashboard">← Back to Dashboard</a>
+      <h1>Edit Rejected Defect — ${rej.project}</h1>
+      <div class="card">
+        <form action="/update-rejected/${rej.id}" method="POST">
+          <div class="form-group"><label>Project *</label><input type="text" name="project" value="${rej.project}" required /></div>
+          <div class="form-group"><label>JIRA ID *</label><input type="text" name="jira_id" value="${rej.jira_id || ''}" required /></div>
+          <div class="form-group"><label>Issue Summary *</label><input type="text" name="issue_summary" value="${rej.issue_summary || ''}" required /></div>
+          <div class="form-group"><label>Reason for Rejection *</label><input type="text" name="reason" value="${rej.reason || ''}" required /></div>
+          <button type="submit" class="btn btn-primary" style="margin-top:10px">Save Changes</button>
+        </form>
+      </div>
+    </div></body></html>`);
+});
+
+app.post("/update-rejected/:id", async (req, res) => {
+  await supabase.from("rejected_defects").update({
+    project: (req.body.project || "").trim(),
+    jira_id: (req.body.jira_id || "").trim(),
+    issue_summary: (req.body.issue_summary || "").trim(),
+    reason: (req.body.reason || "").trim()
+  }).eq("id", req.params.id);
+  res.redirect("/dashboard");
+});
+
+app.get("/delete-rejected/:id", async (req, res) => {
+  await supabase.from("rejected_defects").delete().eq("id", req.params.id);
   res.redirect("/dashboard");
 });
 
