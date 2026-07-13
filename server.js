@@ -164,6 +164,7 @@ function getNav(active) {
     <nav>
       <a href="/" class="${active === 'submit' ? 'active' : ''}">Submit Data</a>
       <a href="/dashboard" class="${active === 'dashboard' ? 'active' : ''}">Dashboard</a>
+      <a href="/monthly" class="${active === 'monthly' ? 'active' : ''}">Monthly Consolidation</a>
     </nav>
   </div>`;
 }
@@ -829,6 +830,275 @@ app.post("/update-rejected/:id", async (req, res) => {
 app.get("/delete-rejected/:id", async (req, res) => {
   await supabase.from("rejected_defects").delete().eq("id", req.params.id);
   res.redirect("/dashboard");
+});
+
+// ===== MONTHLY CONSOLIDATION =====
+// Extract month from a week label like "July 2026 - Week 02 (07 Jul - 11 Jul)"
+function extractMonthKey(weekLabel) {
+  const match = weekLabel.match(/^(\w+ \d{4})/);
+  return match ? match[1] : "";
+}
+
+app.get("/monthly", async (req, res) => {
+  // Get all entries to figure out which months have data
+  const { data: allEntries } = await supabase.from("mainspring_entries").select("week_label, week_start_date").order("week_start_date", { ascending: false });
+
+  // Build unique months from week labels
+  const monthsMap = {};
+  (allEntries || []).forEach(e => {
+    const monthKey = extractMonthKey(e.week_label);
+    if (monthKey && !monthsMap[monthKey]) {
+      monthsMap[monthKey] = e.week_start_date;
+    }
+  });
+
+  // Sort months by their earliest week_start_date (most recent first)
+  const monthsList = Object.entries(monthsMap)
+    .sort((a, b) => new Date(b[1]) - new Date(a[1]))
+    .map(([month]) => month);
+
+  const selectedMonth = req.query.month || (monthsList[0] || "");
+
+  // Build dropdown options
+  const monthOptions = monthsList.map(m => `<option value="${m}" ${m === selectedMonth ? "selected" : ""}>${m}</option>`).join("");
+
+  // Fetch entries for the selected month
+  let entries = [];
+  let rejectedDefects = [];
+  if (selectedMonth) {
+    const { data } = await supabase.from("mainspring_entries").select("*").order("week_start_date", { ascending: true });
+    entries = (data || []).filter(e => extractMonthKey(e.week_label) === selectedMonth);
+
+    if (entries.length > 0) {
+      const entryIds = entries.map(e => e.id);
+      const { data: rejData } = await supabase.from("rejected_defects").select("*").in("entry_id", entryIds);
+      rejectedDefects = rejData || [];
+    }
+  }
+
+  // Get unique week labels in this month, sorted by start date
+  const weeksInMonth = [...new Set(entries.map(e => e.week_label))].sort((a, b) => {
+    const aDate = entries.find(e => e.week_label === a).week_start_date;
+    const bDate = entries.find(e => e.week_label === b).week_start_date;
+    return new Date(aDate) - new Date(bDate);
+  });
+
+  // Function to build a project view from a filtered set of entries
+  function buildProjectView(filteredEntries, projectName, filteredRejected) {
+    const projEntries = filteredEntries.filter(e => e.project === projectName);
+    const numericFields = [
+      "leaves", "requirements",
+      "ft_design_high_tcs", "ft_design_high_time", "ft_design_medium_tcs", "ft_design_medium_time", "ft_design_low_tcs", "ft_design_low_time",
+      "ft_exec_high_tcs", "ft_exec_high_time", "ft_exec_medium_tcs", "ft_exec_medium_time", "ft_exec_low_tcs", "ft_exec_low_time",
+      "rt_design_high_tcs", "rt_design_high_time", "rt_design_medium_tcs", "rt_design_medium_time", "rt_design_low_tcs", "rt_design_low_time",
+      "rt_exec_high_tcs", "rt_exec_high_time", "rt_exec_medium_tcs", "rt_exec_medium_time", "rt_exec_low_tcs", "rt_exec_low_time",
+      "func_defect_critical", "func_defect_high", "func_defect_medium", "func_defect_low", "func_defect_rejected",
+      "reg_defect_critical", "reg_defect_high", "reg_defect_medium", "reg_defect_low",
+      "prod_defect_critical", "prod_defect_high", "prod_defect_medium", "prod_defect_low"
+    ];
+
+    const totals = {};
+    numericFields.forEach(f => totals[f] = 0);
+    let resourceRows = [];
+    let totalResourceCount = 0;
+
+    projEntries.forEach(e => {
+      numericFields.forEach(f => totals[f] += parseFloat(e[f]) || 0);
+      if (e.resource_count || e.resource_activity || e.resource_names) {
+        const count = parseInt(e.resource_count) || 0;
+        totalResourceCount += count;
+        resourceRows.push({
+          sub_team: e.sub_team, count: e.resource_count || "0",
+          activity: e.resource_activity || "-", names: e.resource_names || "-",
+          submitted_by: e.submitted_by,
+          week_label: e.week_label
+        });
+      }
+    });
+
+    return { projEntries, totals, resourceRows, totalResourceCount };
+  }
+
+  // Function to render a project card (used for both weekly and consolidated views)
+  function renderProjectCard(v, proj, allRejected, isConsolidated) {
+    if (v.projEntries.length === 0) {
+      return `<details class="proj-collapse"><summary class="proj-summary"><span class="arrow">▶</span><span class="proj-name">${proj}</span><span class="proj-hint">No data for ${proj}</span></summary><div class="proj-content"><div class="empty-state">No data submitted for ${proj}</div></div></details>`;
+    }
+
+    const resourceTableRows = v.resourceRows.map(r => `
+      <tr>
+        <td><strong style="color:#5b6ee1">${r.sub_team}</strong></td>
+        <td style="text-align:center">${r.count}</td>
+        <td>${r.activity}</td>
+        <td>${r.names}</td>
+        ${isConsolidated ? `<td style="color:#718096;font-size:11px">${r.week_label.split(" - ")[1] || r.week_label}</td>` : ''}
+        <td style="color:#718096;font-size:12px">${r.submitted_by}</td>
+      </tr>
+    `).join("");
+
+    // Build rejected defects section
+    const projEntryIds = v.projEntries.map(e => e.id);
+    const projRejected = allRejected.filter(r => projEntryIds.includes(r.entry_id));
+    let rejectedHtml = "";
+    if (projRejected.length > 0) {
+      const rejRows = projRejected.map(r => {
+        const submitter = v.projEntries.find(e => e.id === r.entry_id);
+        return `<tr>
+          <td><strong>${r.jira_id || "-"}</strong></td>
+          <td>${r.issue_summary || "-"}</td>
+          <td>${r.reason || "-"}</td>
+          <td style="color:#718096;font-size:12px">${submitter ? submitter.sub_team : "-"}</td>
+          ${isConsolidated ? `<td style="color:#718096;font-size:11px">${submitter ? (submitter.week_label.split(" - ")[1] || submitter.week_label) : "-"}</td>` : ''}
+        </tr>`;
+      }).join("");
+      const extraCol = isConsolidated ? '<th>Week</th>' : '';
+      rejectedHtml = `<h3 style="margin-top:14px;color:#c2682a">Rejected Defects (${projRejected.length})</h3>
+      <table>
+        <tr><th>JIRA ID</th><th>Issue Summary</th><th>Reason for Rejection</th><th>Sub-Team</th>${extraCol}</tr>
+        ${rejRows}
+      </table>`;
+    }
+
+    const contributorRows = v.projEntries.map(e => `
+      <tr class="expanded-row">
+        <td colspan="13" style="padding-left:30px">
+          <strong style="color:#5b6ee1">${e.sub_team}</strong> (by ${e.submitted_by})
+          ${isConsolidated ? ` — <span style="color:#c2682a">${e.week_label.split(" - ")[1] || e.week_label}</span>` : ''}
+          - Resources: ${e.resource_count || "0"}, ${e.resource_activity || "-"} (${e.resource_names || "-"})
+          | Leaves: ${e.leaves} | Reqs: ${e.requirements}
+        </td>
+      </tr>
+    `).join("");
+
+    const extraResourceCol = isConsolidated ? '<th>Week</th>' : '';
+
+    return `<details class="proj-collapse">
+      <summary class="proj-summary">
+        <span class="arrow">▶</span>
+        <span class="proj-name">${proj}</span>
+        <span class="proj-hint">${v.projEntries.length} submission(s) — click to expand</span>
+      </summary>
+      <div class="proj-content">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <h2 style="margin:0">${proj} Summary</h2>
+      </div>
+
+      <h3>Resources Working on ${proj}</h3>
+      <table>
+        <tr><th>Sub-Team</th><th style="text-align:center;width:80px">Count</th><th>Activity</th><th>Resource Names</th>${extraResourceCol}<th style="width:120px">Submitted By</th></tr>
+        ${resourceTableRows}
+        <tr class="totals-row">
+          <td><strong>TOTAL</strong></td>
+          <td style="text-align:center"><strong>${v.totalResourceCount}</strong></td>
+          <td colspan="${isConsolidated ? 4 : 3}" style="color:#718096;font-size:12px">Sum of all resources</td>
+        </tr>
+      </table>
+
+      <div style="margin-top:14px;background:#fafafa;padding:14px;border-radius:8px;border:1px solid #e2e8f0">
+        <strong style="color:#5b6ee1">Total Leaves:</strong> ${v.totals.leaves} &nbsp;|&nbsp;
+        <strong style="color:#5b6ee1">Total Requirements:</strong> ${v.totals.requirements}
+      </div>
+
+      <h3 style="margin-top:14px">Functional Testing</h3>
+      <table>
+        <tr><th></th><th>High TCs</th><th>High Hrs</th><th>Med TCs</th><th>Med Hrs</th><th>Low TCs</th><th>Low Hrs</th></tr>
+        <tr class="totals-row"><td>Test Design</td><td>${v.totals.ft_design_high_tcs}</td><td>${v.totals.ft_design_high_time}</td><td>${v.totals.ft_design_medium_tcs}</td><td>${v.totals.ft_design_medium_time}</td><td>${v.totals.ft_design_low_tcs}</td><td>${v.totals.ft_design_low_time}</td></tr>
+        <tr class="totals-row"><td>Test Execution</td><td>${v.totals.ft_exec_high_tcs}</td><td>${v.totals.ft_exec_high_time}</td><td>${v.totals.ft_exec_medium_tcs}</td><td>${v.totals.ft_exec_medium_time}</td><td>${v.totals.ft_exec_low_tcs}</td><td>${v.totals.ft_exec_low_time}</td></tr>
+      </table>
+
+      <h3 style="margin-top:14px">Regression Testing</h3>
+      <table>
+        <tr><th></th><th>High TCs</th><th>High Hrs</th><th>Med TCs</th><th>Med Hrs</th><th>Low TCs</th><th>Low Hrs</th></tr>
+        <tr class="totals-row"><td>Test Design</td><td>${v.totals.rt_design_high_tcs}</td><td>${v.totals.rt_design_high_time}</td><td>${v.totals.rt_design_medium_tcs}</td><td>${v.totals.rt_design_medium_time}</td><td>${v.totals.rt_design_low_tcs}</td><td>${v.totals.rt_design_low_time}</td></tr>
+        <tr class="totals-row"><td>Test Execution</td><td>${v.totals.rt_exec_high_tcs}</td><td>${v.totals.rt_exec_high_time}</td><td>${v.totals.rt_exec_medium_tcs}</td><td>${v.totals.rt_exec_medium_time}</td><td>${v.totals.rt_exec_low_tcs}</td><td>${v.totals.rt_exec_low_time}</td></tr>
+      </table>
+
+      <h3 style="margin-top:14px">Defects</h3>
+      <table>
+        <tr><th></th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Rejected</th></tr>
+        <tr class="totals-row"><td>Functional</td><td>${v.totals.func_defect_critical}</td><td>${v.totals.func_defect_high}</td><td>${v.totals.func_defect_medium}</td><td>${v.totals.func_defect_low}</td><td>${v.totals.func_defect_rejected}</td></tr>
+        <tr class="totals-row"><td>Regression</td><td>${v.totals.reg_defect_critical}</td><td>${v.totals.reg_defect_high}</td><td>${v.totals.reg_defect_medium}</td><td>${v.totals.reg_defect_low}</td><td>-</td></tr>
+        <tr class="totals-row"><td>Production</td><td>${v.totals.prod_defect_critical}</td><td>${v.totals.prod_defect_high}</td><td>${v.totals.prod_defect_medium}</td><td>${v.totals.prod_defect_low}</td><td>-</td></tr>
+      </table>
+
+      ${rejectedHtml}
+
+      <details style="margin-top:14px">
+        <summary style="cursor:pointer;color:#5b6ee1;font-weight:bold;font-size:14px;padding:8px">▶ View Individual Sub-team Contributions (${v.projEntries.length} entries)</summary>
+        <table style="margin-top:10px">
+          ${contributorRows}
+        </table>
+      </details>
+      </div>
+    </details>`;
+  }
+
+  // Build sections for each week in the month
+  const weekSections = weeksInMonth.map(weekLabel => {
+    const weekEntries = entries.filter(e => e.week_label === weekLabel);
+    const weekEntryIds = weekEntries.map(e => e.id);
+    const weekRejected = rejectedDefects.filter(r => weekEntryIds.includes(r.entry_id));
+
+    const projectCards = PROJECTS.map(proj => {
+      const v = buildProjectView(weekEntries, proj, weekRejected);
+      return renderProjectCard(v, proj, weekRejected, false);
+    }).join("");
+
+    // Extract just the "Week XX" and date range for display
+    const shortLabel = weekLabel.split(" - ").slice(1).join(" - ") || weekLabel;
+
+    return `<div class="card" style="border-left:4px solid #5b6ee1;padding-left:20px">
+      <h2 style="color:#5b6ee1;margin-bottom:14px">📅 ${shortLabel}</h2>
+      ${projectCards}
+    </div>`;
+  }).join("");
+
+  // Build the monthly consolidated section (sum of all weeks in the month)
+  let consolidatedSection = "";
+  if (entries.length > 0) {
+    const consolidatedCards = PROJECTS.map(proj => {
+      const v = buildProjectView(entries, proj, rejectedDefects);
+      return renderProjectCard(v, proj, rejectedDefects, true);
+    }).join("");
+
+    consolidatedSection = `<div class="card" style="border-left:4px solid #7fb069;padding-left:20px;background:#f6fbf3">
+      <h2 style="color:#5b8a47;margin-bottom:6px">📊 Monthly Consolidated Total — ${selectedMonth}</h2>
+      <p style="color:#718096;font-size:13px;margin-bottom:16px">Sum of ${weeksInMonth.length} week(s) submitted for ${selectedMonth}</p>
+      ${consolidatedCards}
+    </div>`;
+  }
+
+  res.send(`<!DOCTYPE html><html><head><title>Monthly Consolidation — MainSpring Tracker</title>${getStyles()}</head><body>
+    ${getNav("monthly")}
+    <div class="container">
+      <h1>Monthly Consolidation</h1>
+      <p style="color:#718096;font-size:14px;margin-bottom:18px">View each week's data individually and see the automatic monthly total. All data is read-only here — edits happen in the Dashboard.</p>
+      <div class="card">
+        <form method="GET" action="/monthly" style="display:flex;gap:12px;align-items:flex-end">
+          <div class="form-group" style="flex:1;margin-bottom:0">
+            <label>Select Month to View</label>
+            <select name="month" onchange="this.form.submit()">
+              ${monthOptions || `<option>No data submitted yet</option>`}
+            </select>
+          </div>
+        </form>
+      </div>
+      ${selectedMonth && entries.length > 0 ? `
+        <div style="margin-bottom:14px;display:flex;gap:10px">
+          <button type="button" onclick="toggleAllMonthly(true)" class="btn btn-small" style="background:#7fb069">Expand All</button>
+          <button type="button" onclick="toggleAllMonthly(false)" class="btn btn-small" style="background:#a0aec0">Collapse All</button>
+        </div>
+        <h2 style="color:#5b6ee1;margin-top:10px;margin-bottom:14px">Weekly Breakdown</h2>
+        ${weekSections}
+        ${consolidatedSection}
+      ` : `<div class="card"><div class="empty-state">No data found for the selected month.</div></div>`}
+    </div>
+    <script>
+      function toggleAllMonthly(open) {
+        document.querySelectorAll('.proj-collapse').forEach(d => d.open = open);
+      }
+    </script>
+  </body></html>`);
 });
 
 // ===== START SERVER =====
