@@ -165,6 +165,7 @@ function getNav(active) {
       <a href="/" class="${active === 'submit' ? 'active' : ''}">Submit Data</a>
       <a href="/dashboard" class="${active === 'dashboard' ? 'active' : ''}">Dashboard</a>
       <a href="/monthly" class="${active === 'monthly' ? 'active' : ''}">Monthly Consolidation</a>
+      <a href="/calculation" class="${active === 'calculation' ? 'active' : ''}">Calculation</a>
     </nav>
   </div>`;
 }
@@ -359,7 +360,7 @@ app.get("/", (req, res) => {
             + '<div style="display:grid;grid-template-columns:80px 1fr 2fr 2fr;gap:8px">'
             + '<div class="form-group" style="margin-bottom:0"><div class="field-label">Project</div>'
             + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_project" value="' + project + '" /></div>'
-            + '<div class="form-group" style="margin-bottom:0"><div class="field-label">JIRA ID *</div>'
+            + '<div class="form-group" style="margin-bottom:0"><div class="field-label">Defect ID *</div>'
             + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_jira" data-field="jira" placeholder="e.g. PROJ-1234" value="' + e.jira + '" required /></div>'
             + '<div class="form-group" style="margin-bottom:0"><div class="field-label">Issue Summary *</div>'
             + '<input class="compact-input" type="text" name="rejected_' + project + '_' + i + '_summary" data-field="summary" placeholder="Brief description of the issue" value="' + e.summary + '" required /></div>'
@@ -397,7 +398,7 @@ app.get("/", (req, res) => {
                 const reason = row.querySelector('[data-field=reason]').value.trim();
                 if (!jira || !summary || !reason) {
                   valid = false;
-                  firstError = firstError || ('Project ' + project + ', Rejected Defect #' + (idx+1) + ': all fields (JIRA ID, Issue Summary, Reason) are required');
+                  firstError = firstError || ('Project ' + project + ', Rejected Defect #' + (idx+1) + ': all fields (Defect ID, Issue Summary, Reason) are required');
                 }
               });
             }
@@ -625,7 +626,7 @@ app.get("/dashboard", async (req, res) => {
       }).join("");
       rejectedHtml = `<h3 style="margin-top:14px;color:#c2682a">Rejected Defects (${projRejected.length})</h3>
       <table>
-        <tr><th>JIRA ID</th><th>Issue Summary</th><th>Reason for Rejection</th><th>Sub-Team</th><th>Actions</th></tr>
+        <tr><th>Defect ID</th><th>Issue Summary</th><th>Reason for Rejection</th><th>Sub-Team</th><th>Actions</th></tr>
         ${rejRows}
       </table>`;
     }
@@ -808,7 +809,7 @@ app.get("/edit-rejected/:id", async (req, res) => {
       <div class="card">
         <form action="/update-rejected/${rej.id}" method="POST">
           <div class="form-group"><label>Project *</label><input type="text" name="project" value="${rej.project}" required /></div>
-          <div class="form-group"><label>JIRA ID *</label><input type="text" name="jira_id" value="${rej.jira_id || ''}" required /></div>
+          <div class="form-group"><label>Defect ID *</label><input type="text" name="jira_id" value="${rej.jira_id || ''}" required /></div>
           <div class="form-group"><label>Issue Summary *</label><input type="text" name="issue_summary" value="${rej.issue_summary || ''}" required /></div>
           <div class="form-group"><label>Reason for Rejection *</label><input type="text" name="reason" value="${rej.reason || ''}" required /></div>
           <button type="submit" class="btn btn-primary" style="margin-top:10px">Save Changes</button>
@@ -916,7 +917,21 @@ app.get("/monthly", async (req, res) => {
       }
     });
 
-    return { projEntries, totals, resourceRows, totalResourceCount };
+    // Deduplicate resource names across all weeks within this project.
+    // Same person appearing in multiple weeks (e.g., Mohan in W1-W4) counts as 1.
+    // Matching is case-insensitive and trims whitespace.
+    const uniqueNames = new Set();
+    projEntries.forEach(e => {
+      if (e.resource_names) {
+        e.resource_names.split(",").forEach(name => {
+          const clean = name.trim().toLowerCase();
+          if (clean) uniqueNames.add(clean);
+        });
+      }
+    });
+    const uniqueResourceCount = uniqueNames.size;
+
+    return { projEntries, totals, resourceRows, totalResourceCount, uniqueResourceCount };
   }
 
   // Function to render a project card (used for both weekly and consolidated views)
@@ -954,7 +969,7 @@ app.get("/monthly", async (req, res) => {
       const extraCol = isConsolidated ? '<th>Week</th>' : '';
       rejectedHtml = `<h3 style="margin-top:14px;color:#c2682a">Rejected Defects (${projRejected.length})</h3>
       <table>
-        <tr><th>JIRA ID</th><th>Issue Summary</th><th>Reason for Rejection</th><th>Sub-Team</th>${extraCol}</tr>
+        <tr><th>Defect ID</th><th>Issue Summary</th><th>Reason for Rejection</th><th>Sub-Team</th>${extraCol}</tr>
         ${rejRows}
       </table>`;
     }
@@ -989,8 +1004,8 @@ app.get("/monthly", async (req, res) => {
         ${resourceTableRows}
         <tr class="totals-row">
           <td><strong>TOTAL</strong></td>
-          <td style="text-align:center"><strong>${v.totalResourceCount}</strong></td>
-          <td colspan="${isConsolidated ? 4 : 3}" style="color:#718096;font-size:12px">Sum of all resources</td>
+          <td style="text-align:center"><strong>${isConsolidated ? v.uniqueResourceCount : v.totalResourceCount}</strong></td>
+          <td colspan="${isConsolidated ? 4 : 3}" style="color:#718096;font-size:12px">${isConsolidated ? 'Unique resources across weeks (deduplicated)' : 'Sum of all resources'}</td>
         </tr>
       </table>
 
@@ -1098,6 +1113,170 @@ app.get("/monthly", async (req, res) => {
         document.querySelectorAll('.proj-collapse').forEach(d => d.open = open);
       }
     </script>
+  </body></html>`);
+});
+
+// ===== CALCULATION VIEW =====
+// Shows test case counts (Functional/Regression x Test Design/Test Execution)
+// per week for each project. Only projects with data for the selected month
+// render a table. All values sourced from Submit Data — read-only.
+app.get("/calculation", async (req, res) => {
+  // Discover which months have data (same UX as /monthly)
+  const { data: allEntries } = await supabase
+    .from("mainspring_entries")
+    .select("week_label, week_start_date")
+    .order("week_start_date", { ascending: false });
+
+  const monthsMap = {};
+  (allEntries || []).forEach(e => {
+    const monthKey = extractMonthKey(e.week_label);
+    if (monthKey && !monthsMap[monthKey]) {
+      monthsMap[monthKey] = e.week_start_date;
+    }
+  });
+
+  const monthsList = Object.entries(monthsMap)
+    .sort((a, b) => new Date(b[1]) - new Date(a[1]))
+    .map(([month]) => month);
+
+  const selectedMonth = req.query.month || (monthsList[0] || "");
+  const monthOptions = monthsList.map(m =>
+    `<option value="${m}" ${m === selectedMonth ? "selected" : ""}>${m}</option>`
+  ).join("");
+
+  // Fetch entries for the selected month
+  let entries = [];
+  if (selectedMonth) {
+    const { data } = await supabase
+      .from("mainspring_entries")
+      .select("*")
+      .order("week_start_date", { ascending: true });
+    entries = (data || []).filter(e => extractMonthKey(e.week_label) === selectedMonth);
+  }
+
+  // Unique week labels in the selected month, sorted chronologically
+  const weeksInMonth = [...new Set(entries.map(e => e.week_label))].sort((a, b) => {
+    const aDate = entries.find(e => e.week_label === a).week_start_date;
+    const bDate = entries.find(e => e.week_label === b).week_start_date;
+    return new Date(aDate) - new Date(bDate);
+  });
+
+  // Extract "Week NN" from a full week label like "July 2026 - Week 02 (07 Jul - 11 Jul)"
+  function extractWeekNumber(weekLabel) {
+    const m = weekLabel.match(/Week\s+(\d+)/i);
+    return m ? `Week ${m[1]}` : weekLabel;
+  }
+
+  // Sum a specific test-case group for a set of entries
+  function sumGroup(entriesForCell, prefix) {
+    // prefix: "ft_design" | "ft_exec" | "rt_design" | "rt_exec"
+    return entriesForCell.reduce((total, e) => {
+      return total
+        + (parseFloat(e[`${prefix}_high_tcs`])   || 0)
+        + (parseFloat(e[`${prefix}_medium_tcs`]) || 0)
+        + (parseFloat(e[`${prefix}_low_tcs`])    || 0);
+    }, 0);
+  }
+
+  // Build a calculation table for a single project — returns "" if no data for that project
+  function buildProjectTable(projectName) {
+    const projEntries = entries.filter(e => e.project === projectName);
+    if (projEntries.length === 0) return "";
+
+    // For each week, compute the four totals
+    const weekRows = weeksInMonth.map(weekLabel => {
+      const cellEntries = projEntries.filter(e => e.week_label === weekLabel);
+      if (cellEntries.length === 0) return null; // week has data for other projects but not this one
+
+      return {
+        weekLabel,
+        weekShort: extractWeekNumber(weekLabel),
+        ftDesign: sumGroup(cellEntries, "ft_design"),
+        ftExec:   sumGroup(cellEntries, "ft_exec"),
+        rtDesign: sumGroup(cellEntries, "rt_design"),
+        rtExec:   sumGroup(cellEntries, "rt_exec"),
+      };
+    }).filter(r => r !== null);
+
+    if (weekRows.length === 0) return "";
+
+    // Column-wise sums
+    const sum = weekRows.reduce((acc, r) => ({
+      ftDesign: acc.ftDesign + r.ftDesign,
+      ftExec:   acc.ftExec   + r.ftExec,
+      rtDesign: acc.rtDesign + r.rtDesign,
+      rtExec:   acc.rtExec   + r.rtExec,
+    }), { ftDesign: 0, ftExec: 0, rtDesign: 0, rtExec: 0 });
+
+    const bodyRows = weekRows.map(r => `
+      <tr>
+        <td><strong>${r.weekShort}</strong></td>
+        <td style="text-align:center">${r.ftDesign}</td>
+        <td style="text-align:center">${r.ftExec}</td>
+        <td style="text-align:center">${r.rtDesign}</td>
+        <td style="text-align:center">${r.rtExec}</td>
+      </tr>
+    `).join("");
+
+    return `<div class="card" style="border-left:4px solid #5b6ee1;padding-left:20px">
+      <h2 style="color:#5b6ee1;margin-bottom:14px">📐 ${projectName}</h2>
+      <table>
+        <thead>
+          <tr>
+            <th rowspan="2" style="vertical-align:middle">${selectedMonth}</th>
+            <th colspan="2" style="text-align:center;background:#ebf4ff;color:#4c51bf">Functional</th>
+            <th colspan="2" style="text-align:center;background:#f6fbf3;color:#5b8a47">Regression</th>
+          </tr>
+          <tr>
+            <th style="text-align:center">Test Design</th>
+            <th style="text-align:center">Test Execution</th>
+            <th style="text-align:center">Test Design</th>
+            <th style="text-align:center">Test Execution</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${bodyRows}
+          <tr class="totals-row">
+            <td><strong>Sum</strong></td>
+            <td style="text-align:center"><strong>${sum.ftDesign}</strong></td>
+            <td style="text-align:center"><strong>${sum.ftExec}</strong></td>
+            <td style="text-align:center"><strong>${sum.rtDesign}</strong></td>
+            <td style="text-align:center"><strong>${sum.rtExec}</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <p style="color:#718096;font-size:12px;margin-top:10px">
+        Test Design = High TCs + Medium TCs + Low TCs (design) &nbsp;|&nbsp;
+        Test Execution = High TCs + Medium TCs + Low TCs (execution)
+      </p>
+    </div>`;
+  }
+
+  // Render one table per project — only for projects that have data this month
+  const projectTables = PROJECTS
+    .map(proj => buildProjectTable(proj))
+    .filter(html => html !== "")
+    .join("");
+
+  res.send(`<!DOCTYPE html><html><head><title>Calculation — MainSpring Tracker</title>${getStyles()}</head><body>
+    ${getNav("calculation")}
+    <div class="container">
+      <h1>Calculation</h1>
+      <p style="color:#718096;font-size:14px;margin-bottom:18px">Test case counts per week for each project. All data is read-only and sourced from Submit Data. Only projects with submitted data appear.</p>
+      <div class="card">
+        <form method="GET" action="/calculation" style="display:flex;gap:12px;align-items:flex-end">
+          <div class="form-group" style="flex:1;margin-bottom:0">
+            <label>Select Month to View</label>
+            <select name="month" onchange="this.form.submit()">
+              ${monthOptions || `<option>No data submitted yet</option>`}
+            </select>
+          </div>
+        </form>
+      </div>
+      ${selectedMonth && projectTables
+        ? projectTables
+        : `<div class="card"><div class="empty-state">No data found for the selected month.</div></div>`}
+    </div>
   </body></html>`);
 });
 
